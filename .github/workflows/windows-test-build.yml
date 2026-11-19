@@ -1,0 +1,209 @@
+name: Windows test build (fork only, not for PR)
+
+on:
+  push:
+    branches:
+      - windows-test-build
+  workflow_dispatch:
+
+env:
+  FLUTTER_VERSION: '3.44.0'
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Create env.local.dart
+        shell: bash
+        env:
+          STRAVA_CLIENT_ID: ${{ secrets.STRAVA_CLIENT_ID }}
+          STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}
+          INTERVALS_CLIENT_ID: ${{ secrets.INTERVALS_CLIENT_ID }}
+          INTERVALS_CLIENT_SECRET: ${{ secrets.INTERVALS_CLIENT_SECRET }}
+        run: |
+          mkdir -p lib/config
+          umask 077
+          cat > lib/config/env.local.dart <<EOL
+          class Environment {
+            static const String stravaClientId = '${STRAVA_CLIENT_ID}';
+            static const String stravaClientSecret = '${STRAVA_CLIENT_SECRET}';
+            static const String intervalsClientId = '${INTERVALS_CLIENT_ID}';
+            static const String intervalsClientSecret = '${INTERVALS_CLIENT_SECRET}';
+
+            static bool get hasStravaConfig =>
+              stravaClientId.isNotEmpty && stravaClientSecret.isNotEmpty;
+
+            static bool get hasIntervalsConfig =>
+              intervalsClientId.isNotEmpty && intervalsClientSecret.isNotEmpty;
+          }
+          EOL
+
+      - name: Enable Windows Desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Fetch dependencies
+        run: flutter pub get
+
+      - name: Preload fvp Windows SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $deps = Get-Content '.flutter-plugins-dependencies' -Raw | ConvertFrom-Json
+          $fvp = $deps.plugins.windows | Where-Object { $_.name -eq 'fvp' } | Select-Object -First 1
+          if (-not $fvp) {
+            Write-Host 'fvp is not registered for Windows; skipping SDK preload.'
+            exit 0
+          }
+
+          $fvpWindowsDir = Join-Path $fvp.path 'windows'
+          $sdkMarker = Join-Path $fvpWindowsDir 'mdk-sdk\lib\cmake\FindMDK.cmake'
+          if (Test-Path $sdkMarker) {
+            Write-Host "fvp MDK SDK already exists at $fvpWindowsDir"
+            exit 0
+          }
+
+          function Test-7zArchive($Path) {
+            if (-not (Test-Path $Path)) {
+              return $false
+            }
+            [byte[]] $signature = Get-Content -Path $Path -AsByteStream -TotalCount 6
+            $expectedSignature = @(0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c)
+            if ($signature.Length -ne $expectedSignature.Length) {
+              return $false
+            }
+            for ($i = 0; $i -lt $expectedSignature.Length; $i++) {
+              if ($signature[$i] -ne $expectedSignature[$i]) {
+                return $false
+              }
+            }
+            return $true
+          }
+
+          $packageName = 'mdk-sdk-windows-x64.7z'
+          $archivePath = Join-Path $fvpWindowsDir $packageName
+          $downloadUrls = @()
+          if ($env:FVP_DEPS_URL -match '^https?://') {
+            $baseUrl = $env:FVP_DEPS_URL.TrimEnd('/')
+            $downloadUrls += "$baseUrl/$packageName"
+            if ($baseUrl -like 'https://sourceforge.net/*') {
+              $downloadUrls += "$baseUrl/$packageName/download"
+            }
+          } else {
+            # Direct mirror URLs avoid occasional SourceForge HTML interstitials
+            # from downloads.sourceforge.net on GitHub-hosted Windows runners.
+            $downloadUrls += "https://master.dl.sourceforge.net/project/mdk-sdk/nightly/$packageName?viasf=1"
+            $downloadUrls += "https://cfhcable.dl.sourceforge.net/project/mdk-sdk/nightly/$packageName?viasf=1"
+            $downloadUrls += "https://downloads.sourceforge.net/project/mdk-sdk/nightly/$packageName"
+            $downloadUrls += "https://sourceforge.net/projects/mdk-sdk/files/nightly/$packageName/download"
+          }
+
+          $headers = @{ 'User-Agent' = 'GitHubActions-SS2kConfigApp/1.0' }
+          $downloaded = $false
+          foreach ($downloadUrl in $downloadUrls) {
+            Write-Host "Downloading $packageName from $downloadUrl"
+            Remove-Item -Path $archivePath -Force -ErrorAction SilentlyContinue
+            try {
+              Invoke-WebRequest `
+                -Uri $downloadUrl `
+                -OutFile $archivePath `
+                -Headers $headers `
+                -MaximumRedirection 10
+            } catch {
+              Write-Warning "Download failed from $downloadUrl`: $($_.Exception.Message)"
+              continue
+            }
+
+            if (Test-7zArchive $archivePath) {
+              $downloaded = $true
+              break
+            }
+
+            $contentType = ''
+            try {
+              $contentType = (Get-Item $archivePath).Length
+            } catch {}
+            Write-Warning "Downloaded content from $downloadUrl was not a 7z archive. Size: $contentType bytes"
+          }
+
+          if (-not $downloaded) {
+            throw "Failed to download a valid $packageName from all known MDK SDK URLs."
+          }
+
+          # Some fvp versions let CMake extract through Flutter's .plugin_symlinks path,
+          # which fails on current Windows runners. Extract in the real pub-cache path.
+          Push-Location $fvpWindowsDir
+          try {
+            cmake -E tar xvf $archivePath
+          } finally {
+            Pop-Location
+          }
+
+          if (-not (Test-Path $sdkMarker)) {
+            throw "Failed to preload fvp MDK SDK into $fvpWindowsDir"
+          }
+
+      - name: Render bundled device previews
+        run: flutter test tool/generate_device_previews_test.dart
+
+      - name: Build Windows App
+        run: flutter build windows --release
+
+      - name: Create Inno Setup installer
+        shell: bash
+        env:
+          VERSION: 0.0.0-test
+        run: |
+          mkdir -p artifacts
+          cat > installer.iss <<'EOL'
+          [Setup]
+          AppName=SmartSpin2k Config App
+          AppVersion={#Version}
+          AppPublisher=SmartSpin2k LLC
+          DefaultDirName={pf}\SmartSpin2k Config App
+          SetupIconFile=windows\\runner\\resources\\app_icon.ico
+          UninstallDisplayIcon={app}\\ss2kconfigapp.exe
+          OutputDir=artifacts
+          OutputBaseFilename=ss2kconfigapp-{#Version}-windows
+          Compression=lzma2
+          SolidCompression=yes
+          ArchitecturesInstallIn64BitMode=x64
+
+          [Files]
+          ; Flutter builds Windows x64 into build/windows/x64/runner/Release
+          Source:"build\\windows\\x64\\runner\\Release\\*"; DestDir:"{app}"; Flags: recursesubdirs createallsubdirs
+
+          [Icons]
+          Name:"{group}\\SmartSpin2k Config App"; Filename:"{app}\\ss2kconfigapp.exe"
+          Name:"{commondesktop}\\SmartSpin2k Config App"; Filename:"{app}\\ss2kconfigapp.exe"; Tasks: desktopicon
+
+          [Tasks]
+          Name: "desktopicon"; Description: "Create a &desktop icon"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
+          EOL
+
+          # Inject version into installer script
+          sed -i "s/{#Version}/${VERSION}/g" installer.iss
+
+          # Run Inno Setup Compiler
+          iscc installer.iss
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-artifacts
+          path: artifacts/
